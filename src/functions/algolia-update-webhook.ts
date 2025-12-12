@@ -48,18 +48,25 @@ export const handler: Handler = serializeUncaughtErrorsHandler(async (event) => 
     return { statusCode: 401, body: "Unauthorized" };
   }
 
-  // Parse the webhook notification
-  let notification: WebhookItemNotification;
+  // Parse the webhook payload (contains notifications array)
+  let payload: { notifications: WebhookItemNotification[] };
   try {
-    notification = JSON.parse(event.body);
+    payload = JSON.parse(event.body);
   } catch (error) {
     return { statusCode: 400, body: "Invalid JSON" };
   }
 
-  // Extract project ID from webhook message
-  const projectId = notification.message?.environment_id;
-  if (!projectId) {
-    return { statusCode: 400, body: "Missing project_id in webhook message" };
+  // Get the first notification from the array
+  if (!payload.notifications || payload.notifications.length === 0) {
+    return { statusCode: 400, body: "Missing notifications in webhook payload" };
+  }
+
+  const notification = payload.notifications[0];
+
+  // Extract environment ID from webhook message
+  const environmentId = notification.message?.environment_id;
+  if (!environmentId) {
+    return { statusCode: 400, body: "Missing environment_id in webhook message" };
   }
 
   // Extract item data from webhook
@@ -84,9 +91,9 @@ export const handler: Handler = serializeUncaughtErrorsHandler(async (event) => 
     };
   }
 
-  // Fetch published item from Delivery API using project ID from webhook
+  // Fetch published item from Delivery API using environment ID from webhook
   const deliveryClient = new DeliveryClient({
-    environmentId: projectId,
+    environmentId: environmentId,
     globalHeaders: () => sdkHeaders,
   });
 
@@ -128,7 +135,7 @@ export const handler: Handler = serializeUncaughtErrorsHandler(async (event) => 
         objectID: algoliaRecord.objectID, 
         message: "Successfully indexed item",
         itemCodename: itemCodename,
-        projectId: projectId,
+        environmentId: environmentId,
       }),
     };
   } catch (error: any) {
