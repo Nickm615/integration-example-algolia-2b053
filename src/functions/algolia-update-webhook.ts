@@ -2,20 +2,19 @@ import { DeliveryClient } from "@kontent-ai/delivery-sdk";
 import {
   SignatureHelper,
   WebhookItemNotification,
+  WebhookResponse,
 } from "@kontent-ai/webhook-helper";
 import { Handler } from "@netlify/functions";
 import createAlgoliaClient from "algoliasearch";
 
 import { customUserAgent } from "../shared/algoliaUserAgent";
+import { hasStringProperty, nameOf } from "../shared/utils/typeguards";
 import { convertToAlgoliaItem } from "./utils/algoliaItem";
 import { createEnvVars } from "./utils/createEnvVars";
 import { sdkHeaders } from "./utils/sdkHeaders";
 import { serializeUncaughtErrorsHandler } from "./utils/serializeUncaughtErrorsHandler";
 
-const { envVars, missingEnvVars } = createEnvVars([
-  "KONTENT_SECRET",
-  "ALGOLIA_API_KEY",
-] as const);
+const { envVars, missingEnvVars } = createEnvVars(["KONTENT_SECRET", "ALGOLIA_API_KEY"] as const);
 
 const signatureHeaderName = "x-kontent-ai-signature";
 
@@ -31,7 +30,7 @@ export const handler: Handler = serializeUncaughtErrorsHandler(async (event) => 
   if (!envVars.KONTENT_SECRET || !envVars.ALGOLIA_API_KEY) {
     return {
       statusCode: 500,
-      body: `${missingEnvVars.join(", ")} environment variable(s) are missing, please check the documentation`,
+      body: `${missingEnvVars.join(", ")} environment variables are missing, please check the documentation`,
     };
   }
 
@@ -48,105 +47,123 @@ export const handler: Handler = serializeUncaughtErrorsHandler(async (event) => 
     return { statusCode: 401, body: "Unauthorized" };
   }
 
-  // Parse the webhook payload (contains notifications array)
-  let payload: { notifications: WebhookItemNotification[] };
-  try {
-    payload = JSON.parse(event.body);
-  } catch (error) {
-    return { statusCode: 400, body: "Invalid JSON" };
+  // Parse webhook payload
+  const webhookData: WebhookResponse = JSON.parse(event.body);
+
+  // Get configuration from query string parameters
+  const queryParams = event.queryStringParameters;
+  if (!areValidQueryParams(queryParams)) {
+    return { statusCode: 400, body: "Missing query parameters (slug, appId, index), please check the documentation" };
   }
 
-  // Get the first notification from the array
-  if (!payload.notifications || payload.notifications.length === 0) {
-    return { statusCode: 400, body: "Missing notifications in webhook payload" };
-  }
+  // Initialize Algolia client
+  const algoliaClient = createAlgoliaClient(queryParams.appId, envVars.ALGOLIA_API_KEY, { userAgent: customUserAgent });
+  const index = algoliaClient.initIndex(queryParams.index);
 
-  const notification = payload.notifications[0];
+  // Process each notification
+  const actions = (await Promise.all(
+    webhookData.notifications
+      .filter(n => n.message.object_type === "content_item")
+      .map(async notification => {
+        if (!isItemNotification(notification)) {
+          return [];
+        }
 
-  // Extract environment ID from webhook message
-  const environmentId = notification.message?.environment_id;
-  if (!environmentId) {
-    return { statusCode: 400, body: "Missing environment_id in webhook message" };
-  }
+        const deliveryClient = new DeliveryClient({
+          environmentId: notification.message.environment_id,
+          globalHeaders: () => sdkHeaders,
+        });
 
-  // Extract item data from webhook
-  if (!notification.data?.system) {
-    return { statusCode: 400, body: "Missing system data in webhook" };
-  }
-
-  const itemCodename = notification.data.system.codename;
-  if (!itemCodename) {
-    return { statusCode: 400, body: "Missing item codename in webhook" };
-  }
-  
-  // Get Algolia configuration from environment variables
-  const algoliaAppId = process.env.ALGOLIA_APP_ID;
-  const algoliaIndexName = process.env.ALGOLIA_INDEX_NAME;
-  const slugCodename = process.env.SLUG_CODENAME || "url"; // Default to "url"
-
-  if (!algoliaAppId || !algoliaIndexName) {
-    return {
-      statusCode: 500,
-      body: "Missing ALGOLIA_APP_ID or ALGOLIA_INDEX_NAME environment variables",
-    };
-  }
-
-  // Fetch published item from Delivery API using environment ID from webhook
-  const deliveryClient = new DeliveryClient({
-    environmentId: environmentId,
-    globalHeaders: () => sdkHeaders,
-  });
-
-  try {
-    // Fetch the specific item that was published
-    const response = await deliveryClient
-      .item(itemCodename)
-      .queryConfig({ waitForLoadingNewContent: true })
-      .toPromise();
-
-    const publishedItem = response.data.item;
-
-    // Also fetch all items to build the map (needed for linked items processing)
-    const allItemsResponse = await deliveryClient
-      .items()
-      .queryConfig({ waitForLoadingNewContent: true })
-      .toPromise();
-
-    const allItemsMap = new Map(
-      [...allItemsResponse.data.items, ...Object.values(allItemsResponse.data.linkedItems)]
-        .map(i => [i.system.codename, i])
-    );
-
-    // Transform to Algolia record
-    const algoliaRecord = convertToAlgoliaItem(allItemsMap, slugCodename)(publishedItem);
-
-    // Update Algolia
-    const algoliaClient = createAlgoliaClient(
-      algoliaAppId,
-      envVars.ALGOLIA_API_KEY,
-      { userAgent: customUserAgent }
-    );
-    const index = algoliaClient.initIndex(algoliaIndexName);
-    await index.saveObject(algoliaRecord).wait();
-
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ 
-        objectID: algoliaRecord.objectID, 
-        message: "Successfully indexed item",
-        itemCodename: itemCodename,
-        environmentId: environmentId,
+        return await updateItem({
+          index,
+          deliveryClient,
+          slug: queryParams.slug,
+          item: notification.data.system,
+        });
       }),
-    };
-  } catch (error: any) {
-    console.error("Error fetching or indexing item:", error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({
-        error: "Failed to fetch or index item",
-        details: error.message,
-        itemCodename: itemCodename,
-      }),
-    };
-  }
+  )).flat();
+
+  const recordsToReIndex = [
+    ...new Map(actions.flatMap(a => a.recordsToReindex.map(i => [i.codename, i] as const))).values(),
+  ];
+  const objectIdsToRemove = [...new Set(actions.flatMap(a => a.objectIdsToRemove))];
+
+  const reIndexResponse = recordsToReIndex.length ? await index.saveObjects(recordsToReIndex).wait() : undefined;
+  const deletedResponse = objectIdsToRemove.length ? await index.deleteObjects(objectIdsToRemove).wait() : undefined;
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({
+      deletedObjectIds: deletedResponse?.objectIDs ?? [],
+      reIndexedObjectIds: reIndexResponse?.objectIDs ?? [],
+    }),
+  };
 });
+
+type UpdateItemParams = Readonly<{
+  index: any; // SearchIndex type
+  deliveryClient: DeliveryClient;
+  slug: string;
+  item: WebhookItemNotification["data"]["system"];
+}>;
+
+const updateItem = async (params: UpdateItemParams) => {
+  // Fetch the published item with all its linked items
+  const deliverItems = await findDeliveryItemWithChildrenByCodename(
+    params.deliveryClient,
+    params.item.codename,
+    params.item.language,
+  );
+  
+  const deliverItem = deliverItems.get(params.item.codename);
+
+  if (!deliverItem) {
+    // Item not found (might be unpublished) - no action needed
+    return [{
+      objectIdsToRemove: [],
+      recordsToReindex: [],
+    }];
+  }
+
+  // Transform to Algolia record
+  const algoliaRecord = convertToAlgoliaItem(deliverItem, params.slug)(deliverItem);
+
+  return [{
+    objectIdsToRemove: [],
+    recordsToReindex: [algoliaRecord],
+  }];
+};
+
+const findDeliveryItemWithChildrenByCodename = async (
+  deliveryClient: DeliveryClient,
+  codename: string,
+  languageCodename: string,
+): Promise<ReadonlyMap<string, any>> => {
+  try {
+    const response = await deliveryClient
+      .item(codename)
+      .queryConfig({ waitForLoadingNewContent: true })
+      .languageParameter(languageCodename)
+      .depthParameter(100)
+      .toPromise();
+
+    return new Map([response.data.item, ...Object.values(response.data.linkedItems)].map(i => [i.system.codename, i]));
+  } catch {
+    return new Map();
+  }
+};
+
+type ExpectedQueryParams = Readonly<{
+  slug: string;
+  appId: string;
+  index: string;
+}>;
+
+const areValidQueryParams = (v: Record<string, unknown> | null): v is ExpectedQueryParams =>
+  v !== null
+  && hasStringProperty(nameOf<ExpectedQueryParams>("slug"), v)
+  && hasStringProperty(nameOf<ExpectedQueryParams>("appId"), v)
+  && hasStringProperty(nameOf<ExpectedQueryParams>("index"), v);
+
+const isItemNotification = (notification: any): notification is WebhookItemNotification =>
+  notification.message.object_type === "content_item";
