@@ -51,11 +51,30 @@ export const handler: Handler = serializeUncaughtErrorsHandler(async (event) => 
   const algoliaClient = createAlgoliaClient(body.algoliaAppId, envVars.ALGOLIA_API_KEY, { userAgent: customUserAgent });
   const index = algoliaClient.initIndex(body.algoliaIndexName);
   await index.setSettings({
-    searchableAttributes: ["content.contents", "content.name", "name"],
-    attributesForFaceting: ["content.codename", "language"],
-    attributesToSnippet: ["content.contents:80"],
-  }).wait();
-  const result = await index.saveObjects(recordItems).wait();
+    searchableAttributes: [
+      'campground_name',
+      'description',
+      'city',
+      'state',
+      'address',
+      'amenities',
+      'ways_to_stay',
+      'content.contents',
+      'content.name',
+      'name',
+    ],
+    attributesForFaceting: [
+      'searchable(state)',
+      'searchable(city)',
+      'searchable(amenities)',
+      'searchable(ways_to_stay)',
+      'searchable(region)',
+      'type',
+      'content.codename',
+      'language',
+    ],
+    attributesToSnippet: ['description:80', 'content.contents:80'],
+  }).wait();  const result = await index.saveObjects(recordItems).wait();
 
   return {
     statusCode: 200,
